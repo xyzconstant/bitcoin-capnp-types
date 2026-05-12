@@ -960,7 +960,7 @@ async fn chain_handle_notifications_delivers_mempool_added() {
         req.get().get_context().unwrap().set_thread(thread.clone());
         req.get().set_notifications(notifications.clone());
         let resp = req.send().promise.await.unwrap();
-        let _handler = resp.get().unwrap().get_result().unwrap();
+        let handler = resp.get().unwrap().get_result().unwrap();
 
         // Drain any prior mempool state so the subsequent self-transfer is
         // unambiguously the trigger.
@@ -988,6 +988,10 @@ async fn chain_handle_notifications_delivers_mempool_added() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         inject.await.unwrap();
+
+        let mut req = handler.destroy_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.send().promise.await.unwrap();
     })
     .await;
 }
