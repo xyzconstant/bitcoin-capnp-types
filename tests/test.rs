@@ -3,10 +3,12 @@ use bitcoin_capnp_types::{mining_capnp, proxy_capnp::thread};
 mod util;
 
 use util::bitcoin_core::{
-    destroy_template, make_block_template, mempool_tx_count, with_init_client, with_mining_client,
+    destroy_template, make_block_template, mempool_tx_count, with_chain_client, with_init_client,
+    with_mining_client,
 };
 use util::bitcoin_core_wallet::{
     bitcoin_test_wallet, create_mempool_self_transfer, ensure_wallet_loaded_and_funded,
+    mine_blocks_to_new_address,
 };
 use util::block::{block_solution, block_with_pow};
 
@@ -506,4 +508,275 @@ async fn wallet_helpers_create_mempool_transaction() {
         before + 1,
         "self-transfer should add one mempool transaction"
     );
+}
+
+// -- Chain interface tests ---------------------------------------------------
+
+/// Smoke test the Chain interface bootstrap path and basic queries.
+#[tokio::test]
+#[serial_test::parallel]
+async fn chain_basic_queries() {
+    with_chain_client(|_init, thread, chain| async move {
+        // getHeight
+        let mut req = chain.get_height_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        let resp = req.send().promise.await.unwrap();
+        let res = resp.get().unwrap();
+        assert!(res.get_has_result(), "node should have a tip height");
+        let height: i32 = res.get_result();
+        assert!(
+            height >= 101,
+            "bootstrap helper should ensure height >= 101"
+        );
+
+        // getBlockHash at the tip
+        let mut req = chain.get_block_hash_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_height(height);
+        let resp = req.send().promise.await.unwrap();
+        let hash = resp.get().unwrap().get_result().unwrap();
+        assert_eq!(hash.len(), 32, "block hash must be 32 bytes");
+
+        // isInitialBlockDownload
+        let mut req = chain.is_initial_block_download_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        let resp = req.send().promise.await.unwrap();
+        let _ibd: bool = resp.get().unwrap().get_result();
+
+        // havePruned
+        let mut req = chain.have_pruned_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        let resp = req.send().promise.await.unwrap();
+        assert!(!resp.get().unwrap().get_result(), "regtest is not pruned");
+    })
+    .await;
+}
+
+/// Verify findBlock(wantData=true) returns the full serialized block. This is
+/// the call electrs uses to fetch raw blocks via IPC instead of P2P.
+#[tokio::test]
+#[serial_test::parallel]
+async fn chain_find_block_returns_data() {
+    with_chain_client(|_init, thread, chain| async move {
+        // Fetch the genesis block (height 0) via getBlockHash + findBlock.
+        let mut req = chain.get_block_hash_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_height(0);
+        let resp = req.send().promise.await.unwrap();
+        let genesis_hash: Vec<u8> = resp.get().unwrap().get_result().unwrap().to_vec();
+
+        let mut req = chain.find_block_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_hash(&genesis_hash);
+        {
+            let mut params = req.get().init_block();
+            params.set_want_data(true);
+            params.set_want_height(true);
+            params.set_want_hash(true);
+        }
+        let resp = req.send().promise.await.unwrap();
+        let result = resp.get().unwrap();
+        assert!(result.get_result(), "genesis block must be findable");
+        let block_result = result.get_block().unwrap();
+        let data = block_result.get_data().unwrap();
+        assert!(
+            data.len() > 80,
+            "serialized block (header + txs) must be > 80 bytes, got {}",
+            data.len()
+        );
+        let echoed_hash = block_result.get_hash().unwrap();
+        assert_eq!(echoed_hash, genesis_hash.as_slice());
+        assert_eq!(block_result.get_height(), 0);
+    })
+    .await;
+}
+
+/// Verify broadcastTransaction succeeds for a transaction that is already in
+/// the mempool. The node treats this as a re-announcement and returns OK,
+/// which is enough to exercise the request/response framing end-to-end.
+///
+/// This is the call electrs uses (when configured with the IPC backend) to
+/// replace JSON-RPC `sendrawtransaction`.
+#[tokio::test]
+#[serial_test::serial]
+async fn chain_broadcast_transaction() {
+    let wallet = bitcoin_test_wallet();
+    ensure_wallet_loaded_and_funded(&wallet);
+    let tx = create_mempool_self_transfer(&wallet);
+    let tx_bytes = encoding::encode_to_vec(&tx);
+
+    with_chain_client(|_init, thread, chain| async move {
+        let mut req = chain.broadcast_transaction_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_tx(&tx_bytes);
+        // max_tx_fee = 0 means "don't enforce a maximum"; the node will skip
+        // the test_accept fee check and re-announce the existing mempool tx.
+        req.get().set_max_tx_fee(0);
+        // node::TxBroadcast::MEMPOOL_AND_BROADCAST_TO_ALL = 0
+        req.get().set_broadcast_method(0);
+        let resp = req.send().promise.await.unwrap();
+        let r = resp.get().unwrap();
+        assert!(
+            r.get_result(),
+            "broadcastTransaction should succeed (re-announce path); error: {:?}",
+            r.get_error().ok().and_then(|e| e.to_str().ok())
+        );
+    })
+    .await;
+}
+
+/// Verify findAncestorByHeight returns the expected block hash.
+#[tokio::test]
+#[serial_test::parallel]
+async fn chain_find_ancestor_by_height() {
+    with_chain_client(|_init, thread, chain| async move {
+        // Look up the tip first.
+        let mut req = chain.get_height_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        let resp = req.send().promise.await.unwrap();
+        let height: i32 = resp.get().unwrap().get_result();
+
+        let mut req = chain.get_block_hash_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_height(height);
+        let resp = req.send().promise.await.unwrap();
+        let tip_hash: Vec<u8> = resp.get().unwrap().get_result().unwrap().to_vec();
+
+        // Ask for ancestor at height 50 starting from the tip.
+        let mut req = chain.find_ancestor_by_height_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_block_hash(&tip_hash);
+        req.get().set_ancestor_height(50);
+        {
+            let mut params = req.get().init_ancestor();
+            params.set_want_hash(true);
+            params.set_want_height(true);
+        }
+        let resp = req.send().promise.await.unwrap();
+        let result = resp.get().unwrap();
+        assert!(result.get_result(), "ancestor at height 50 must exist");
+        let ancestor = result.get_ancestor().unwrap();
+        assert_eq!(ancestor.get_height(), 50);
+        assert_eq!(ancestor.get_hash().unwrap().len(), 32);
+    })
+    .await;
+}
+
+/// Verify findLocatorFork returns the height of the last common block when
+/// passed a CBlockLocator containing only the genesis block hash.
+///
+/// CBlockLocator wire format (Bitcoin Core src/primitives/block.h):
+///   int32 LE version (DUMMY_VERSION = 70016) + CompactSize count + 32*count
+///   block hashes ordered tip→genesis.
+///
+/// This is the call electrs uses to find the fork point between its own
+/// header chain and the node's active chain when syncing new headers via IPC
+/// instead of P2P `getheaders`.
+#[tokio::test]
+#[serial_test::parallel]
+async fn chain_find_locator_fork() {
+    with_chain_client(|_init, thread, chain| async move {
+        // Get genesis hash via getBlockHash(0).
+        let mut req = chain.get_block_hash_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_height(0);
+        let resp = req.send().promise.await.unwrap();
+        let genesis_hash: Vec<u8> = resp.get().unwrap().get_result().unwrap().to_vec();
+        assert_eq!(genesis_hash.len(), 32);
+
+        // Build CBlockLocator { version=70016, vHave=[genesis] }.
+        let mut locator = Vec::with_capacity(4 + 1 + 32);
+        locator.extend_from_slice(&70016i32.to_le_bytes());
+        locator.push(1u8); // CompactSize for length 1
+        locator.extend_from_slice(&genesis_hash);
+
+        let mut req = chain.find_locator_fork_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_locator(&locator);
+        let resp = req.send().promise.await.unwrap();
+        let r = resp.get().unwrap();
+        assert!(
+            r.get_has_result(),
+            "fork height must be reported for genesis-only locator"
+        );
+        assert_eq!(
+            r.get_result(),
+            0,
+            "fork height for genesis-only locator must be 0"
+        );
+    })
+    .await;
+}
+
+/// Verify waitForNotificationsIfTipChanged returns immediately when the
+/// supplied `oldTip` does not match the current tip. This is the cheap
+/// no-op case (called when electrs is already aware of the latest tip).
+#[tokio::test]
+#[serial_test::parallel]
+async fn chain_wait_for_notifications_returns_immediately_when_tip_differs() {
+    with_chain_client(|_init, thread, chain| async move {
+        let mut req = chain.wait_for_notifications_if_tip_changed_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        // All-zeros hash is guaranteed not to be the current tip.
+        req.get().set_old_tip(&[0u8; 32]);
+        let fut = req.send().promise;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut).await;
+        assert!(
+            result.is_ok(),
+            "waitForNotificationsIfTipChanged should return ~immediately when oldTip != current tip"
+        );
+        result.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// Verify waitForNotificationsIfTipChanged blocks until a new block arrives
+/// when called with the current tip hash, then returns. This is the call
+/// electrs uses (when configured with the IPC backend) to replace its P2P
+/// `inv`-watching loop for new-block notifications.
+#[tokio::test]
+#[serial_test::serial]
+async fn chain_wait_for_notifications_unblocks_on_new_block() {
+    let wallet = bitcoin_test_wallet();
+    ensure_wallet_loaded_and_funded(&wallet);
+
+    with_chain_client(|_init, thread, chain| async move {
+        // Snapshot current tip.
+        let mut req = chain.get_height_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        let resp = req.send().promise.await.unwrap();
+        let height: i32 = resp.get().unwrap().get_result();
+
+        let mut req = chain.get_block_hash_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_height(height);
+        let resp = req.send().promise.await.unwrap();
+        let tip_hash: Vec<u8> = resp.get().unwrap().get_result().unwrap().to_vec();
+
+        // Kick off the wait *before* mining the block so we exercise the
+        // blocking path rather than the immediate-return path.
+        let mut req = chain.wait_for_notifications_if_tip_changed_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_old_tip(&tip_hash);
+        let wait_fut = req.send().promise;
+
+        // Mine one block from a separate task so we don't deadlock the
+        // current_thread runtime on the bitcoin-cli subprocess.
+        let mine_wallet = wallet.clone();
+        let mine_handle = tokio::task::spawn_blocking(move || {
+            // Small delay so the wait is established before the block lands.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            mine_blocks_to_new_address(&mine_wallet, 1)
+                .expect("failed to mine block to wake the wait");
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), wait_fut).await;
+        assert!(
+            result.is_ok(),
+            "waitForNotificationsIfTipChanged should unblock after a new block is mined"
+        );
+        result.unwrap().unwrap();
+        mine_handle.await.unwrap();
+    })
+    .await;
 }
