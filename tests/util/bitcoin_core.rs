@@ -9,6 +9,7 @@ use crate::util::bitcoin_core_wallet::{
     mine_blocks_to_new_address,
 };
 use bitcoin_capnp_types::{
+    chain_capnp::{chain, unstable_chain},
     init_capnp::init,
     mining_capnp::{block_template, mining},
     proxy_capnp::thread_map,
@@ -107,6 +108,30 @@ where
     .await;
 }
 
+pub async fn with_chain_client<F, Fut>(f: F)
+where
+    F: FnOnce(init::Client, chain::Client) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    with_init_client(|client| async move {
+        let chain_client = make_chain(&client).await;
+        f(client, chain_client).await;
+    })
+    .await;
+}
+
+pub async fn with_unstable_chain_client<F, Fut>(f: F)
+where
+    F: FnOnce(init::Client, unstable_chain::Client) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    with_init_client(|client| async move {
+        let unstable_chain_client = make_unstable_chain(&client).await;
+        f(client, unstable_chain_client).await;
+    })
+    .await;
+}
+
 pub async fn connect_unix_stream(
     path: impl AsRef<Path>,
 ) -> VatNetwork<BufReader<Compat<OwnedReadHalf>>> {
@@ -169,6 +194,18 @@ pub async fn make_mining(init: &init::Client) -> mining::Client {
 /// Obtain a Rpc client from an Init client.
 pub async fn make_rpc(init: &init::Client) -> rpc::Client {
     let resp = init.make_rpc_request().send().promise.await.unwrap();
+    resp.get().unwrap().get_result().unwrap()
+}
+
+/// Obtain a Chain client from an Init client.
+pub async fn make_chain(init: &init::Client) -> chain::Client {
+    let resp = init.make_chain_request().send().promise.await.unwrap();
+    resp.get().unwrap().get_result().unwrap()
+}
+
+/// Obtain an UnstableChain client from an Init client.
+pub async fn make_unstable_chain(init: &init::Client) -> unstable_chain::Client {
+    let resp = init.make_unstable_chain_request().send().promise.await.unwrap();
     resp.get().unwrap().get_result().unwrap()
 }
 

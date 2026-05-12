@@ -1,4 +1,4 @@
-# Copyright (c) 2021 The Bitcoin Core developers
+# Copyright (c) 2021-present The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -8,6 +8,7 @@ using Cxx = import "/capnp/c++.capnp";
 $Cxx.namespace("ipc::capnp::messages");
 
 using Proxy = import "proxy.capnp";
+using Chain = import "chain.capnp";
 using Echo = import "echo.capnp";
 using Mining = import "mining.capnp";
 using Rpc = import "rpc.capnp";
@@ -17,6 +18,11 @@ interface Init $Proxy.wrap("interfaces::Init") {
     makeEcho @1 (context :Proxy.Context) -> (result :Echo.Echo);
     makeMining @3 (context :Proxy.Context) -> (result :Mining.Mining);
     makeRpc @4 (context :Proxy.Context) -> (result :Rpc.Rpc);
+    makeChain @5 (context :Proxy.Context) -> (result :Chain.Chain);
+    # Unstable chain interface for Bitcoin Core's own clients. This method is
+    # renumbered whenever UnstableChain changes incompatibly, so old clients
+    # get an error instead of calling the wrong methods.
+    makeUnstableChain @6 (context :Proxy.Context) -> (result :Chain.UnstableChain) $Proxy.name("makeChain");
 
     # DEPRECATED: no longer supported; server returns an error.
     makeMiningOld2 @2 () -> ();
