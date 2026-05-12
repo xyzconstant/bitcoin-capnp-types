@@ -4,7 +4,8 @@ use bitcoin_capnp_types::{
     init_capnp::init,
     mining_capnp,
     proxy_capnp::{thread, thread_map},
-    chain_capnp::chain_notifications
+    chain_capnp::chain_notifications,
+    common_capnp::expected
 };
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp::Side};
 use encoding::encode_to_vec;
@@ -1348,6 +1349,84 @@ async fn unstable_chain_basic_queries() {
         // havePruned
         let resp = chain.have_pruned_request().send().promise.await.unwrap();
         assert!(!resp.get().unwrap().get_result(), "regtest is not pruned");
+    })
+    .await;
+}
+
+/// Decode a serialized `CFeeRate` blob (`SERIALIZE_METHODS(CFeeRate, obj)
+/// { READWRITE(obj.m_feerate.fee, obj.m_feerate.size); }`, where
+/// `m_feerate` is a `FeeFrac { int64_t fee; int32_t size; }`) into
+/// satoshis per kilo-vbyte, matching `CFeeRate::GetFeePerK()`.
+fn fee_rate_sat_per_kvb(blob: &[u8]) -> i64 {
+    assert_eq!(
+        blob.len(),
+        12,
+        "CFeeRate wire format is FeeFrac (int64 LE fee + int32 LE size)"
+    );
+    let fee = i64::from_le_bytes(blob[0..8].try_into().unwrap());
+    let size = i32::from_le_bytes(blob[8..12].try_into().unwrap()) as i64;
+    if size == 0 {
+        return 0;
+    }
+    fee.saturating_mul(1000) / size
+}
+
+/// Verify `Chain.relayMinFee` returns the node's minimum relay feerate as a
+/// serialized `CFeeRate` (default `DEFAULT_MIN_RELAY_TX_FEE = 100`
+/// sat/kvB). This is the IPC equivalent of `getnetworkinfo`'s `relayfee`
+/// field used by electrs's `Daemon::get_relay_fee`.
+#[tokio::test]
+#[serial_test::parallel]
+async fn unstable_chain_relay_min_fee_returns_default() {
+    with_unstable_chain_client(|_init, chain| async move {
+        let resp = chain.relay_min_fee_request().send().promise.await.unwrap();
+        let blob = resp.get().unwrap().get_result().unwrap();
+        let sat_per_kvb = fee_rate_sat_per_kvb(blob);
+        assert_eq!(
+            sat_per_kvb, 100,
+            "regtest defaults to DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB"
+        );
+    })
+    .await;
+}
+
+/// Verify `Chain.getFeeRateEstimate` returns a decodable
+/// `Expected(FeeRateEstimation, FeeRateEstimationError)` on regtest, where
+/// the fee estimator has no data to work with. Unlike the other fee methods,
+/// the feerate here is a Cap'n Proto `FeePerVSize` struct rather than a
+/// serialized `CFeeRate` blob.
+#[tokio::test]
+#[serial_test::parallel]
+async fn unstable_chain_get_fee_rate_estimate_returns_decodable_result() {
+    with_unstable_chain_client(|_init, chain| async move {
+        let mut req = chain.get_fee_rate_estimate_request();
+        {
+            let mut params = req.get();
+            params.set_num_blocks(2);
+            params.set_conservative(false);
+        }
+        let resp = req.send().promise.await.unwrap();
+        let result = resp.get().unwrap().get_result().unwrap();
+        match result.which().unwrap() {
+            // Other tests create mempool traffic on the shared node, so
+            // tolerate a successful estimate as well as the "no data" error.
+            expected::Value(estimation) => {
+                let estimation = estimation.unwrap();
+                let feerate = estimation.get_feerate().unwrap();
+                assert!(feerate.get_size() > 0, "feerate size must be positive");
+                assert!(feerate.get_fee() >= 0, "feerate fee must not be negative");
+                assert!(
+                    estimation.get_returned_target() > 0,
+                    "a successful estimate must report its target"
+                );
+            }
+            expected::Error(error) => {
+                let error = error.unwrap();
+                let reason = error.get_reason().unwrap().to_str().unwrap();
+                assert!(!reason.is_empty(), "estimation error must carry a reason");
+                error.get_estimation().unwrap();
+            }
+        }
     })
     .await;
 }
