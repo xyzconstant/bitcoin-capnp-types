@@ -1,4 +1,7 @@
-use bitcoin_capnp_types::{mining_capnp, proxy_capnp::thread};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use bitcoin_capnp_types::{chain_capnp::chain_notifications, mining_capnp, proxy_capnp::thread};
 
 mod util;
 
@@ -777,6 +780,193 @@ async fn chain_wait_for_notifications_unblocks_on_new_block() {
         );
         result.unwrap().unwrap();
         mine_handle.await.unwrap();
+    })
+    .await;
+}
+
+/// Minimal `ChainNotifications::Server` used by the notification tests
+/// below. Records every `transactionAddedToMempool` /
+/// `transactionRemovedFromMempool` event in interior-mutable buffers so the
+/// test body can poll them. Other notification methods accept and ignore
+/// the call (they're delivered too, but the tests don't assert on them).
+#[derive(Default)]
+struct RecordingNotifications {
+    added: Rc<RefCell<Vec<Vec<u8>>>>,
+    #[allow(clippy::type_complexity)]
+    removed: Rc<RefCell<Vec<(Vec<u8>, i32)>>>,
+}
+
+impl chain_notifications::Server for RecordingNotifications {
+    fn destroy(
+        self: Rc<Self>,
+        _: chain_notifications::DestroyParams,
+        _: chain_notifications::DestroyResults,
+    ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+        std::future::ready(Ok(()))
+    }
+
+    fn transaction_added_to_mempool(
+        self: Rc<Self>,
+        params: chain_notifications::TransactionAddedToMempoolParams,
+        _: chain_notifications::TransactionAddedToMempoolResults,
+    ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+        let added = self.added.clone();
+        async move {
+            let p = params.get()?;
+            let tx = p.get_tx()?.to_vec();
+            added.borrow_mut().push(tx);
+            Ok(())
+        }
+    }
+
+    fn transaction_removed_from_mempool(
+        self: Rc<Self>,
+        params: chain_notifications::TransactionRemovedFromMempoolParams,
+        _: chain_notifications::TransactionRemovedFromMempoolResults,
+    ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+        let removed = self.removed.clone();
+        async move {
+            let p = params.get()?;
+            let tx = p.get_tx()?.to_vec();
+            let reason = p.get_reason();
+            removed.borrow_mut().push((tx, reason));
+            Ok(())
+        }
+    }
+
+    fn block_connected(
+        self: Rc<Self>,
+        _: chain_notifications::BlockConnectedParams,
+        _: chain_notifications::BlockConnectedResults,
+    ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+        std::future::ready(Ok(()))
+    }
+
+    fn block_disconnected(
+        self: Rc<Self>,
+        _: chain_notifications::BlockDisconnectedParams,
+        _: chain_notifications::BlockDisconnectedResults,
+    ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+        std::future::ready(Ok(()))
+    }
+
+    fn updated_block_tip(
+        self: Rc<Self>,
+        _: chain_notifications::UpdatedBlockTipParams,
+        _: chain_notifications::UpdatedBlockTipResults,
+    ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+        std::future::ready(Ok(()))
+    }
+
+    fn chain_state_flushed(
+        self: Rc<Self>,
+        _: chain_notifications::ChainStateFlushedParams,
+        _: chain_notifications::ChainStateFlushedResults,
+    ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+        std::future::ready(Ok(()))
+    }
+}
+
+/// Verify `Chain.handleNotifications` delivers `transactionAddedToMempool`
+/// callbacks when a new transaction enters the node's mempool. This is the
+/// path electrs (when configured with the IPC backend) needs to use to
+/// retire its periodic `getrawmempool` polling.
+#[tokio::test]
+#[serial_test::serial]
+async fn chain_handle_notifications_delivers_mempool_added() {
+    let wallet = bitcoin_test_wallet();
+    ensure_wallet_loaded_and_funded(&wallet);
+
+    with_chain_client(|_init, thread, chain| async move {
+        let recorder = Rc::new(RecordingNotifications::default());
+        let recorder_for_assert = recorder.clone();
+        let notifications: chain_notifications::Client =
+            capnp_rpc::new_client_from_rc(recorder.clone());
+
+        // Register the handler. We must keep the returned Handler client
+        // alive for the duration of the subscription.
+        let mut req = chain.handle_notifications_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_notifications(notifications.clone());
+        let resp = req.send().promise.await.unwrap();
+        let _handler = resp.get().unwrap().get_result().unwrap();
+
+        // Drain any prior mempool state so the subsequent self-transfer is
+        // unambiguously the trigger.
+        recorder_for_assert.added.borrow_mut().clear();
+
+        // Inject a fresh transaction into the node's mempool from a
+        // blocking task (bitcoin-cli is sync) and wait for the notification
+        // to arrive.
+        let inject_wallet = wallet.clone();
+        let inject = tokio::task::spawn_blocking(move || {
+            create_mempool_self_transfer(&inject_wallet);
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if !recorder_for_assert.added.borrow().is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "transactionAddedToMempool was not delivered within 15s; recorded={}",
+                    recorder_for_assert.added.borrow().len()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        inject.await.unwrap();
+    })
+    .await;
+}
+
+/// Verify `Chain.requestMempoolTransactions` replays the current mempool
+/// contents through the supplied `ChainNotifications` handler. This is the
+/// "give me what's already in the mempool" primer electrs needs at startup
+/// before switching to the live notification stream.
+#[tokio::test]
+#[serial_test::serial]
+async fn chain_request_mempool_transactions_replays_current_mempool() {
+    let wallet = bitcoin_test_wallet();
+    ensure_wallet_loaded_and_funded(&wallet);
+
+    // Seed the mempool with a single transaction synchronously (outside
+    // the runtime) so it's already there when we ask for the snapshot.
+    let _seed = create_mempool_self_transfer(&wallet);
+    assert!(
+        mempool_tx_count() >= 1,
+        "expected at least one tx in the node's mempool before request"
+    );
+
+    with_chain_client(|_init, thread, chain| async move {
+        let recorder = Rc::new(RecordingNotifications::default());
+        let notifications: chain_notifications::Client =
+            capnp_rpc::new_client_from_rc(recorder.clone());
+
+        let mut req = chain.request_mempool_transactions_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        req.get().set_notifications(notifications);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(15), req.send().promise)
+            .await
+            .expect("requestMempoolTransactions timed out");
+        resp.expect("requestMempoolTransactions failed");
+
+        // The replay is fire-and-forget on the server side; give the
+        // delivered callbacks a brief moment to land on our LocalSet
+        // before asserting.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !recorder.added.borrow().is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "requestMempoolTransactions delivered no transactionAddedToMempool callbacks"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     })
     .await;
 }
