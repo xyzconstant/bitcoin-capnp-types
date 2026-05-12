@@ -555,6 +555,77 @@ async fn chain_basic_queries() {
     .await;
 }
 
+/// Decode a serialized `CFeeRate` blob (`SERIALIZE_METHODS(CFeeRate, obj)
+/// { READWRITE(obj.m_feerate.fee, obj.m_feerate.size); }`, where
+/// `m_feerate` is a `FeeFrac { int64_t fee; int32_t size; }`) into
+/// satoshis per kilo-vbyte, matching `CFeeRate::GetFeePerK()`.
+fn fee_rate_sat_per_kvb(blob: &[u8]) -> i64 {
+    assert_eq!(
+        blob.len(),
+        12,
+        "CFeeRate wire format is FeeFrac (int64 LE fee + int32 LE size)"
+    );
+    let fee = i64::from_le_bytes(blob[0..8].try_into().unwrap());
+    let size = i32::from_le_bytes(blob[8..12].try_into().unwrap()) as i64;
+    if size == 0 {
+        return 0;
+    }
+    fee.saturating_mul(1000) / size
+}
+
+/// Verify `Chain.relayMinFee` returns the node's minimum relay feerate as a
+/// serialized `CFeeRate` (default `DEFAULT_MIN_RELAY_TX_FEE = 100`
+/// sat/kvB). This is the IPC equivalent of `getnetworkinfo`'s `relayfee`
+/// field used by electrs's `Daemon::get_relay_fee`.
+#[tokio::test]
+#[serial_test::parallel]
+async fn chain_relay_min_fee_returns_default() {
+    with_chain_client(|_init, thread, chain| async move {
+        let mut req = chain.relay_min_fee_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        let resp = req.send().promise.await.unwrap();
+        let blob = resp.get().unwrap().get_result().unwrap();
+        let sat_per_kvb = fee_rate_sat_per_kvb(blob);
+        assert_eq!(
+            sat_per_kvb, 100,
+            "regtest defaults to DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB"
+        );
+    })
+    .await;
+}
+
+/// Verify `Chain.estimateSmartFee` returns a (zeroed) `CFeeRate` blob on
+/// regtest, where the smart fee estimator has no data to work with. The
+/// shape of the response is what matters: callers must be able to decode
+/// `result :Data` as a `CFeeRate`.
+#[tokio::test]
+#[serial_test::parallel]
+async fn chain_estimate_smart_fee_returns_decodable_blob() {
+    with_chain_client(|_init, thread, chain| async move {
+        let mut req = chain.estimate_smart_fee_request();
+        req.get().get_context().unwrap().set_thread(thread.clone());
+        {
+            let mut params = req.get();
+            params.set_num_blocks(2);
+            params.set_conservative(false);
+            params.set_want_calc(false);
+        }
+        let resp = req.send().promise.await.unwrap();
+        let blob = resp.get().unwrap().get_result().unwrap();
+        let sat_per_kvb = fee_rate_sat_per_kvb(blob);
+        // Regtest has no estimator history, so we expect the "no data"
+        // sentinel of CFeeRate{} (fee=0, size=0 -> can't divide; the
+        // serializer ships zeros and we treat that as "no estimate").
+        // We tolerate either 0 or a positive value (in case a future
+        // node version returns the floor of the relay fee here).
+        assert!(
+            sat_per_kvb >= 0,
+            "estimateSmartFee should never produce a negative feerate"
+        );
+    })
+    .await;
+}
+
 /// Verify findBlock(wantData=true) returns the full serialized block. This is
 /// the call electrs uses to fetch raw blocks via IPC instead of P2P.
 #[tokio::test]
