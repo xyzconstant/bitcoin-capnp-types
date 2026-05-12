@@ -67,14 +67,24 @@ where
     F: FnOnce(init::Client, thread::Client) -> Fut,
     Fut: Future<Output = ()>,
 {
+    // Per-test wall-clock cap. The happy path of every test in this file
+    // completes in a few seconds against a warm regtest node, but bugs in
+    // the wait/notification machinery (or a stuck node) can make these
+    // futures hang indefinitely -- which then ties up the CI runner until
+    // its job-level timeout fires and prints unhelpful output. Bound it
+    // here so a misbehaving test fails with a clear message instead.
+    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     let rpc_network = connect_unix_stream(unix_socket_path()).await;
     let rpc_system = RpcSystem::new(Box::new(rpc_network), None);
-    LocalSet::new()
-        .run_until(async move {
-            let (client, thread) = bootstrap(rpc_system).await;
-            f(client, thread).await;
-        })
-        .await;
+    let local = LocalSet::new();
+    let body = local.run_until(async move {
+        let (client, thread) = bootstrap(rpc_system).await;
+        f(client, thread).await;
+    });
+    tokio::time::timeout(TEST_TIMEOUT, body)
+        .await
+        .unwrap_or_else(|_| panic!("test exceeded {TEST_TIMEOUT:?} wall-clock budget"));
 }
 
 pub async fn with_mining_client<F, Fut>(f: F)
