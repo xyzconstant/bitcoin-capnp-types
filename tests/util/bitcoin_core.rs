@@ -11,6 +11,7 @@ use bitcoin_capnp_types::{
     init_capnp::init,
     mining_capnp::{block_template, mining},
     proxy_capnp::{thread, thread_map},
+    rpc_capnp::rpc,
 };
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp::Side, twoparty::VatNetwork};
 use futures::io::BufReader;
@@ -88,6 +89,18 @@ where
     .await;
 }
 
+pub async fn with_rpc_client<F, Fut>(f: F)
+where
+    F: FnOnce(init::Client, thread::Client, rpc::Client) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    with_init_client(|client, thread| async move {
+        let rpc = make_rpc(&client, &thread).await;
+        f(client, thread, rpc).await;
+    })
+    .await;
+}
+
 pub async fn connect_unix_stream(
     path: impl AsRef<Path>,
 ) -> VatNetwork<BufReader<Compat<OwnedReadHalf>>> {
@@ -146,6 +159,14 @@ pub async fn bootstrap(
 /// Obtain a Mining client from an Init client.
 pub async fn make_mining(init: &init::Client, thread: &thread::Client) -> mining::Client {
     let mut req = init.make_mining_request();
+    req.get().get_context().unwrap().set_thread(thread.clone());
+    let resp = req.send().promise.await.unwrap();
+    resp.get().unwrap().get_result().unwrap()
+}
+
+/// Obtain a Rpc client from an Init client.
+pub async fn make_rpc(init: &init::Client, thread: &thread::Client) -> rpc::Client {
+    let mut req = init.make_rpc_request();
     req.get().get_context().unwrap().set_thread(thread.clone());
     let resp = req.send().promise.await.unwrap();
     resp.get().unwrap().get_result().unwrap()

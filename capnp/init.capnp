@@ -10,10 +10,12 @@ $Cxx.namespace("ipc::capnp::messages");
 using Proxy = import "proxy.capnp";
 using Echo = import "echo.capnp";
 using Mining = import "mining.capnp";
+using Rpc = import "rpc.capnp";
 
 interface Init $Proxy.wrap("interfaces::Init") {
     construct @0 (threadMap: Proxy.ThreadMap) -> (threadMap :Proxy.ThreadMap);
     makeEcho @1 (context :Proxy.Context) -> (result :Echo.Echo);
     makeMiningOld2 @2 () -> ();
     makeMining @3 (context :Proxy.Context) -> (result :Mining.Mining);
+    makeRpc @4 (context :Proxy.Context) -> (result :Rpc.Rpc);
 }

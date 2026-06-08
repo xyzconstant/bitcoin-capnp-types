@@ -7,10 +7,12 @@ mod bitcoin_core_wallet_util;
 
 use bitcoin_core_util::{
     destroy_template, make_block_template, mempool_tx_count, with_init_client, with_mining_client,
+    with_rpc_client,
 };
 use bitcoin_core_wallet_util::{
     bitcoin_test_wallet, create_mempool_self_transfer, ensure_wallet_loaded_and_funded,
 };
+use serde_json::{Value, json};
 
 #[tokio::test]
 #[serial_test::parallel]
@@ -36,6 +38,41 @@ async fn integration() {
             .to_string()
             .unwrap();
         assert_eq!("Hello world", text);
+    })
+    .await;
+}
+
+/// Test the RPC interface by calling `getblockcount`
+#[tokio::test]
+#[serial_test::parallel]
+async fn rpc_query_getblockcount() {
+    with_rpc_client(|_client, thread, rpc| async move {
+        let mut execute_rpc_request = rpc.execute_rpc_request();
+        execute_rpc_request
+            .get()
+            .get_context()
+            .unwrap()
+            .set_thread(thread.clone());
+        let j: Value = json!({
+            "method": "getblockcount",
+            "params": [],
+            "id": "test",
+            "jsonrpc": "2.0"
+        });
+        execute_rpc_request.get().set_request(j.to_string());
+        let exec_rpc_response = execute_rpc_request.send().promise.await.unwrap();
+        let result = exec_rpc_response
+            .get()
+            .unwrap()
+            .get_result()
+            .unwrap()
+            .to_string()
+            .unwrap();
+        let v: Value = serde_json::from_str(&result)
+            .map_err(|e| format!("failed to parse rpc response as JSON: {e}"))
+            .unwrap();
+        // Tests are boostrapped with 101 blocks. See `ensure_bootstrap_chain_ready()`
+        assert_eq!(101, v["result"]);
     })
     .await;
 }

@@ -6,6 +6,7 @@ fn main() {
         .file("capnp/echo.capnp")
         .file("capnp/init.capnp")
         .file("capnp/mining.capnp")
+        .file("capnp/rpc.capnp")
         .file("capnp/proxy.capnp")
         .run()
         .unwrap();
